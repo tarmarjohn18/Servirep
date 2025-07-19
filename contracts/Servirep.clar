@@ -6,12 +6,19 @@
 (define-constant ERR_INVALID_RATING (err u407))
 (define-constant ERR_SERVICE_INACTIVE (err u408))
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u409))
+(define-constant ERR_SUBSCRIPTION_NOT_FOUND (err u410))
+(define-constant ERR_SUBSCRIPTION_EXPIRED (err u411))
+(define-constant ERR_SUBSCRIPTION_CANCELLED (err u412))
+(define-constant ERR_INVALID_TIER (err u413))
+(define-constant ERR_SUBSCRIPTION_EXISTS (err u414))
+(define-constant ERR_INVALID_DURATION (err u415))
 
 (define-non-fungible-token service-nft uint)
 
 (define-data-var service-id-counter uint u0)
 (define-data-var review-id-counter uint u0)
 (define-data-var platform-fee uint u1000)
+(define-data-var subscription-id-counter uint u0)
 
 (define-map services uint {
   owner: principal,
@@ -39,6 +46,32 @@
 (define-map service-reviews uint (list 100 uint))
 (define-map user-reviews principal (list 50 uint))
 (define-map review-votes {review: uint, voter: principal} bool)
+
+(define-map service-tiers uint {
+  service-id: uint,
+  tier-name: (string-ascii 32),
+  tier-level: uint,
+  monthly-price: uint,
+  features: (string-ascii 256),
+  max-usage: uint,
+  active: bool
+})
+
+(define-map subscriptions uint {
+  subscriber: principal,
+  service-id: uint,
+  tier-id: uint,
+  start-block: uint,
+  end-block: uint,
+  auto-renew: bool,
+  status: (string-ascii 16),
+  total-paid: uint,
+  usage-count: uint
+})
+
+(define-map user-subscriptions principal (list 20 uint))
+(define-map service-tier-list uint (list 10 uint))
+(define-map service-subscription-list uint (list 50 uint))
 
 (define-public (create-service (name (string-ascii 64)) (description (string-ascii 256)) (category (string-ascii 32)) (price uint))
   (let ((new-service-id (+ (var-get service-id-counter) u1)))
@@ -213,3 +246,187 @@
 
 (define-read-only (has-voted-helpful (user principal) (review-id uint))
   (is-some (map-get? review-votes {review: review-id, voter: user})))
+
+(define-public (create-service-tier (service-id uint) (tier-name (string-ascii 32)) (tier-level uint) (monthly-price uint) (features (string-ascii 256)) (max-usage uint))
+  (let ((service (unwrap! (map-get? services service-id) ERR_SERVICE_NOT_FOUND))
+        (new-tier-id (+ (var-get subscription-id-counter) u1)))
+    (begin
+      (asserts! (is-eq tx-sender (get owner service)) ERR_NOT_AUTHORIZED)
+      (asserts! (> monthly-price u0) ERR_INSUFFICIENT_PAYMENT)
+      (asserts! (and (>= tier-level u1) (<= tier-level u5)) ERR_INVALID_TIER)
+      
+      (map-set service-tiers new-tier-id {
+        service-id: service-id,
+        tier-name: tier-name,
+        tier-level: tier-level,
+        monthly-price: monthly-price,
+        features: features,
+        max-usage: max-usage,
+        active: true
+      })
+      
+      (let ((current-tiers (default-to (list) (map-get? service-tier-list service-id))))
+        (map-set service-tier-list service-id (unwrap! (as-max-len? (append current-tiers new-tier-id) u10) (err u500))))
+      
+      (var-set subscription-id-counter new-tier-id)
+      (ok new-tier-id))))
+
+(define-public (subscribe-to-service (tier-id uint) (duration-blocks uint) (auto-renew bool))
+  (let ((tier (unwrap! (map-get? service-tiers tier-id) ERR_SUBSCRIPTION_NOT_FOUND))
+        (service (unwrap! (map-get? services (get service-id tier)) ERR_SERVICE_NOT_FOUND))
+        (new-subscription-id (+ (var-get subscription-id-counter) u1))
+        (monthly-blocks u4320)
+        (total-cost (* (get monthly-price tier) (/ duration-blocks monthly-blocks))))
+    (begin
+      (asserts! (get active service) ERR_SERVICE_INACTIVE)
+      (asserts! (get active tier) ERR_INVALID_TIER)
+      (asserts! (>= duration-blocks monthly-blocks) ERR_INVALID_DURATION)
+      
+      (let ((fee-amount (/ (* total-cost (var-get platform-fee)) u100000))
+            (service-amount (- total-cost fee-amount)))
+        (try! (stx-transfer? fee-amount tx-sender CONTRACT_OWNER))
+        (try! (stx-transfer? service-amount tx-sender (get owner service))))
+      
+      (map-set subscriptions new-subscription-id {
+        subscriber: tx-sender,
+        service-id: (get service-id tier),
+        tier-id: tier-id,
+        start-block: stacks-block-height,
+        end-block: (+ stacks-block-height duration-blocks),
+        auto-renew: auto-renew,
+        status: "active",
+        total-paid: total-cost,
+        usage-count: u0
+      })
+      
+      (let ((current-user-subs (default-to (list) (map-get? user-subscriptions tx-sender))))
+        (map-set user-subscriptions tx-sender (unwrap! (as-max-len? (append current-user-subs new-subscription-id) u20) (err u501))))
+      
+      (let ((current-service-subs (default-to (list) (map-get? service-subscription-list (get service-id tier)))))
+        (map-set service-subscription-list (get service-id tier) (unwrap! (as-max-len? (append current-service-subs new-subscription-id) u50) (err u502))))
+      
+      (var-set subscription-id-counter new-subscription-id)
+      (ok new-subscription-id))))
+
+(define-public (renew-subscription (subscription-id uint) (duration-blocks uint))
+  (let ((subscription (unwrap! (map-get? subscriptions subscription-id) ERR_SUBSCRIPTION_NOT_FOUND))
+        (tier (unwrap! (map-get? service-tiers (get tier-id subscription)) ERR_SUBSCRIPTION_NOT_FOUND))
+        (service (unwrap! (map-get? services (get service-id subscription)) ERR_SERVICE_NOT_FOUND))
+        (monthly-blocks u4320)
+        (total-cost (* (get monthly-price tier) (/ duration-blocks monthly-blocks))))
+    (begin
+      (asserts! (is-eq tx-sender (get subscriber subscription)) ERR_NOT_AUTHORIZED)
+      (asserts! (is-eq (get status subscription) "active") ERR_SUBSCRIPTION_CANCELLED)
+      (asserts! (>= duration-blocks monthly-blocks) ERR_INVALID_DURATION)
+      
+      (let ((fee-amount (/ (* total-cost (var-get platform-fee)) u100000))
+            (service-amount (- total-cost fee-amount)))
+        (try! (stx-transfer? fee-amount tx-sender CONTRACT_OWNER))
+        (try! (stx-transfer? service-amount tx-sender (get owner service))))
+      
+      (map-set subscriptions subscription-id (merge subscription {
+        end-block: (+ (get end-block subscription) duration-blocks),
+        total-paid: (+ (get total-paid subscription) total-cost)
+      }))
+      (ok true))))
+
+(define-public (cancel-subscription (subscription-id uint))
+  (let ((subscription (unwrap! (map-get? subscriptions subscription-id) ERR_SUBSCRIPTION_NOT_FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender (get subscriber subscription)) ERR_NOT_AUTHORIZED)
+      (asserts! (is-eq (get status subscription) "active") ERR_SUBSCRIPTION_CANCELLED)
+      
+      (map-set subscriptions subscription-id (merge subscription {
+        status: "cancelled",
+        auto-renew: false
+      }))
+      (ok true))))
+
+(define-public (toggle-tier-status (tier-id uint))
+  (let ((tier (unwrap! (map-get? service-tiers tier-id) ERR_SUBSCRIPTION_NOT_FOUND))
+        (service (unwrap! (map-get? services (get service-id tier)) ERR_SERVICE_NOT_FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender (get owner service)) ERR_NOT_AUTHORIZED)
+      (map-set service-tiers tier-id (merge tier {
+        active: (not (get active tier))
+      }))
+      (ok true))))
+
+(define-public (update-tier-pricing (tier-id uint) (new-monthly-price uint))
+  (let ((tier (unwrap! (map-get? service-tiers tier-id) ERR_SUBSCRIPTION_NOT_FOUND))
+        (service (unwrap! (map-get? services (get service-id tier)) ERR_SERVICE_NOT_FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender (get owner service)) ERR_NOT_AUTHORIZED)
+      (asserts! (> new-monthly-price u0) ERR_INSUFFICIENT_PAYMENT)
+      
+      (map-set service-tiers tier-id (merge tier {
+        monthly-price: new-monthly-price
+      }))
+      (ok true))))
+
+(define-public (record-service-usage (subscription-id uint))
+  (let ((subscription (unwrap! (map-get? subscriptions subscription-id) ERR_SUBSCRIPTION_NOT_FOUND))
+        (tier (unwrap! (map-get? service-tiers (get tier-id subscription)) ERR_SUBSCRIPTION_NOT_FOUND))
+        (service (unwrap! (map-get? services (get service-id subscription)) ERR_SERVICE_NOT_FOUND)))
+    (begin
+      (asserts! (or (is-eq tx-sender (get owner service)) (is-eq tx-sender (get subscriber subscription))) ERR_NOT_AUTHORIZED)
+      (asserts! (is-eq (get status subscription) "active") ERR_SUBSCRIPTION_CANCELLED)
+      (asserts! (> (get end-block subscription) stacks-block-height) ERR_SUBSCRIPTION_EXPIRED)
+      (asserts! (< (get usage-count subscription) (get max-usage tier)) (err u416))
+      
+      (map-set subscriptions subscription-id (merge subscription {
+        usage-count: (+ (get usage-count subscription) u1)
+      }))
+      (ok true))))
+
+(define-public (auto-renew-check (subscription-id uint))
+  (let ((subscription (unwrap! (map-get? subscriptions subscription-id) ERR_SUBSCRIPTION_NOT_FOUND)))
+    (begin
+      (asserts! (and 
+        (get auto-renew subscription)
+        (is-eq (get status subscription) "active")
+        (<= (get end-block subscription) stacks-block-height)) 
+        ERR_SUBSCRIPTION_EXPIRED)
+      
+      (map-set subscriptions subscription-id (merge subscription {
+        status: "expired"
+      }))
+      (ok true))))
+
+(define-read-only (get-service-tier (tier-id uint))
+  (map-get? service-tiers tier-id))
+
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? subscriptions subscription-id))
+
+(define-read-only (get-service-tiers (service-id uint))
+  (map-get? service-tier-list service-id))
+
+(define-read-only (get-user-subscriptions (user principal))
+  (map-get? user-subscriptions user))
+
+(define-read-only (get-service-subscriptions (service-id uint))
+  (map-get? service-subscription-list service-id))
+
+(define-read-only (is-subscription-active (subscription-id uint))
+  (match (map-get? subscriptions subscription-id)
+    subscription (and 
+      (is-eq (get status subscription) "active")
+      (> (get end-block subscription) stacks-block-height))
+    false))
+
+(define-read-only (get-subscription-usage-remaining (subscription-id uint))
+  (match (map-get? subscriptions subscription-id)
+    subscription 
+      (match (map-get? service-tiers (get tier-id subscription))
+        tier (- (get max-usage tier) (get usage-count subscription))
+        u0)
+    u0))
+
+(define-read-only (get-subscription-blocks-remaining (subscription-id uint))
+  (match (map-get? subscriptions subscription-id)
+    subscription 
+      (if (> (get end-block subscription) stacks-block-height)
+        (- (get end-block subscription) stacks-block-height)
+        u0)
+    u0))
