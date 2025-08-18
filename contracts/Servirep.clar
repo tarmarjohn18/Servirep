@@ -12,6 +12,14 @@
 (define-constant ERR_INVALID_TIER (err u413))
 (define-constant ERR_SUBSCRIPTION_EXISTS (err u414))
 (define-constant ERR_INVALID_DURATION (err u415))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u416))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u417))
+(define-constant ERR_DISPUTE_CLOSED (err u418))
+(define-constant ERR_NOT_ARBITRATOR (err u419))
+(define-constant ERR_INVALID_DISPUTE_STATUS (err u420))
+(define-constant ERR_EVIDENCE_LIMIT_REACHED (err u421))
+(define-constant ERR_VOTING_PERIOD_ENDED (err u422))
+(define-constant ERR_ALREADY_VOTED (err u423))
 
 (define-non-fungible-token service-nft uint)
 
@@ -19,6 +27,8 @@
 (define-data-var review-id-counter uint u0)
 (define-data-var platform-fee uint u1000)
 (define-data-var subscription-id-counter uint u0)
+(define-data-var dispute-id-counter uint u0)
+(define-data-var arbitrator-stake uint u1000000)
 
 (define-map services uint {
   owner: principal,
@@ -72,6 +82,39 @@
 (define-map user-subscriptions principal (list 20 uint))
 (define-map service-tier-list uint (list 10 uint))
 (define-map service-subscription-list uint (list 50 uint))
+
+(define-map disputes uint {
+  dispute-id: uint,
+  service-id: uint,
+  complainant: principal,
+  respondent: principal,
+  dispute-type: (string-ascii 32),
+  description: (string-ascii 512),
+  amount-disputed: uint,
+  status: (string-ascii 16),
+  created-at: uint,
+  voting-end-block: uint,
+  arbitrator-count: uint,
+  votes-for-complainant: uint,
+  votes-for-respondent: uint,
+  resolved: bool,
+  resolution: (string-ascii 256)
+})
+
+(define-map arbitrators principal {
+  active: bool,
+  total-cases: uint,
+  successful-cases: uint,
+  stake-amount: uint,
+  joined-at: uint
+})
+
+(define-map dispute-arbitrators {dispute: uint, arbitrator: principal} bool)
+(define-map arbitrator-votes {dispute: uint, arbitrator: principal} (string-ascii 16))
+(define-map dispute-evidence uint (list 10 (string-ascii 256)))
+(define-map user-disputes principal (list 20 uint))
+(define-map service-disputes uint (list 30 uint))
+(define-map active-arbitrator-list principal (list 50 principal))
 
 (define-public (create-service (name (string-ascii 64)) (description (string-ascii 256)) (category (string-ascii 32)) (price uint))
   (let ((new-service-id (+ (var-get service-id-counter) u1)))
@@ -430,3 +473,232 @@
         (- (get end-block subscription) stacks-block-height)
         u0)
     u0))
+
+(define-public (register-as-arbitrator)
+  (let ((stake-amount (var-get arbitrator-stake)))
+    (begin
+      (asserts! (is-none (map-get? arbitrators tx-sender)) (err u424))
+      (try! (stx-transfer? stake-amount tx-sender CONTRACT_OWNER))
+      
+      (map-set arbitrators tx-sender {
+        active: true,
+        total-cases: u0,
+        successful-cases: u0,
+        stake-amount: stake-amount,
+        joined-at: stacks-block-height
+      })
+      
+      (let ((current-arbitrators (default-to (list) (map-get? active-arbitrator-list CONTRACT_OWNER))))
+        (map-set active-arbitrator-list CONTRACT_OWNER (unwrap! (as-max-len? (append current-arbitrators tx-sender) u50) (err u500))))
+      
+      (ok true))))
+
+(define-public (create-dispute (service-id uint) (dispute-type (string-ascii 32)) (description (string-ascii 512)) (amount-disputed uint))
+  (let ((service (unwrap! (map-get? services service-id) ERR_SERVICE_NOT_FOUND))
+        (new-dispute-id (+ (var-get dispute-id-counter) u1))
+        (voting-period u2160))
+    (begin
+      (asserts! (> amount-disputed u0) ERR_INSUFFICIENT_PAYMENT)
+      (asserts! (not (is-eq tx-sender (get owner service))) ERR_NOT_AUTHORIZED)
+      
+      (map-set disputes new-dispute-id {
+        dispute-id: new-dispute-id,
+        service-id: service-id,
+        complainant: tx-sender,
+        respondent: (get owner service),
+        dispute-type: dispute-type,
+        description: description,
+        amount-disputed: amount-disputed,
+        status: "open",
+        created-at: stacks-block-height,
+        voting-end-block: (+ stacks-block-height voting-period),
+        arbitrator-count: u0,
+        votes-for-complainant: u0,
+        votes-for-respondent: u0,
+        resolved: false,
+        resolution: ""
+      })
+      
+      (let ((current-user-disputes (default-to (list) (map-get? user-disputes tx-sender))))
+        (map-set user-disputes tx-sender (unwrap! (as-max-len? (append current-user-disputes new-dispute-id) u20) (err u501))))
+      
+      (let ((current-service-disputes (default-to (list) (map-get? service-disputes service-id))))
+        (map-set service-disputes service-id (unwrap! (as-max-len? (append current-service-disputes new-dispute-id) u30) (err u502))))
+      
+      (var-set dispute-id-counter new-dispute-id)
+      (ok new-dispute-id))))
+
+(define-public (assign-arbitrators-to-dispute (dispute-id uint) (arbitrator-list (list 5 principal)))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+      (asserts! (is-eq (get status dispute) "open") ERR_DISPUTE_CLOSED)
+      
+      (try! (assign-arbitrators-helper dispute-id arbitrator-list))
+      
+      (map-set disputes dispute-id (merge dispute {
+        status: "arbitration",
+        arbitrator-count: (len arbitrator-list)
+      }))
+      (ok true))))
+
+(define-public (submit-evidence (dispute-id uint) (evidence (string-ascii 256)))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND)))
+    (begin
+      (asserts! (or (is-eq tx-sender (get complainant dispute)) (is-eq tx-sender (get respondent dispute))) ERR_NOT_AUTHORIZED)
+      (asserts! (is-eq (get status dispute) "arbitration") ERR_INVALID_DISPUTE_STATUS)
+      
+      (let ((current-evidence (default-to (list) (map-get? dispute-evidence dispute-id))))
+        (asserts! (< (len current-evidence) u10) ERR_EVIDENCE_LIMIT_REACHED)
+        (map-set dispute-evidence dispute-id (unwrap! (as-max-len? (append current-evidence evidence) u10) (err u500))))
+      
+      (ok true))))
+
+(define-public (vote-on-dispute (dispute-id uint) (vote-for-complainant bool))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+        (arbitrator (unwrap! (map-get? arbitrators tx-sender) ERR_NOT_ARBITRATOR))
+        (vote-key {dispute: dispute-id, arbitrator: tx-sender}))
+    (begin
+      (asserts! (get active arbitrator) ERR_NOT_ARBITRATOR)
+      (asserts! (is-eq (get status dispute) "arbitration") ERR_INVALID_DISPUTE_STATUS)
+      (asserts! (> (get voting-end-block dispute) stacks-block-height) ERR_VOTING_PERIOD_ENDED)
+      (asserts! (is-some (map-get? dispute-arbitrators {dispute: dispute-id, arbitrator: tx-sender})) ERR_NOT_ARBITRATOR)
+      (asserts! (is-none (map-get? arbitrator-votes vote-key)) ERR_ALREADY_VOTED)
+      
+      (if vote-for-complainant
+        (begin
+          (map-set arbitrator-votes vote-key "complainant")
+          (map-set disputes dispute-id (merge dispute {
+            votes-for-complainant: (+ (get votes-for-complainant dispute) u1)
+          })))
+        (begin
+          (map-set arbitrator-votes vote-key "respondent")
+          (map-set disputes dispute-id (merge dispute {
+            votes-for-respondent: (+ (get votes-for-respondent dispute) u1)
+          }))))
+      
+      (ok true))))
+
+(define-public (resolve-dispute (dispute-id uint))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+      (asserts! (is-eq (get status dispute) "arbitration") ERR_INVALID_DISPUTE_STATUS)
+      (asserts! (<= (get voting-end-block dispute) stacks-block-height) ERR_VOTING_PERIOD_ENDED)
+      
+      (let ((complainant-wins (> (get votes-for-complainant dispute) (get votes-for-respondent dispute)))
+            (refund-amount (get amount-disputed dispute)))
+        (if complainant-wins
+          (begin
+            (try! (stx-transfer? refund-amount (get respondent dispute) (get complainant dispute)))
+            (map-set disputes dispute-id (merge dispute {
+              status: "resolved",
+              resolved: true,
+              resolution: "Complainant awarded refund"
+            })))
+          (map-set disputes dispute-id (merge dispute {
+            status: "resolved",
+            resolved: true,
+            resolution: "Respondent cleared of wrongdoing"
+          }))))
+      
+      (try! (update-arbitrator-stats dispute-id))
+      (ok true))))
+
+(define-public (withdraw-arbitrator-stake)
+  (let ((arbitrator (unwrap! (map-get? arbitrators tx-sender) ERR_NOT_ARBITRATOR)))
+    (begin
+      (asserts! (get active arbitrator) ERR_NOT_ARBITRATOR)
+      
+      (try! (stx-transfer? (get stake-amount arbitrator) CONTRACT_OWNER tx-sender))
+      
+      (map-set arbitrators tx-sender (merge arbitrator {
+        active: false
+      }))
+      (ok true))))
+
+(define-public (set-arbitrator-stake (new-stake uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-stake u0) ERR_INSUFFICIENT_PAYMENT)
+    (var-set arbitrator-stake new-stake)
+    (ok true)))
+
+(define-private (assign-arbitrators-helper (dispute-id uint) (arbitrator-list (list 5 principal)))
+  (fold assign-single-arbitrator arbitrator-list (ok dispute-id)))
+
+(define-private (assign-single-arbitrator (arbitrator principal) (result (response uint uint)))
+  (match result
+    success-dispute-id
+      (let ((arbitrator-data (map-get? arbitrators arbitrator)))
+        (if (and (is-some arbitrator-data) (get active (unwrap-panic arbitrator-data)))
+          (begin
+            (map-set dispute-arbitrators {dispute: success-dispute-id, arbitrator: arbitrator} true)
+            (map-set arbitrators arbitrator (merge (unwrap-panic arbitrator-data) {
+              total-cases: (+ (get total-cases (unwrap-panic arbitrator-data)) u1)
+            }))
+            (ok success-dispute-id))
+          (ok success-dispute-id)))
+    error-val (err error-val)))
+
+(define-private (update-arbitrator-stats (dispute-id uint))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+        (majority-vote (> (get votes-for-complainant dispute) (get votes-for-respondent dispute))))
+    (fold update-arbitrator-success 
+          (get-dispute-arbitrators dispute-id) 
+          (ok {dispute-id: dispute-id, majority-for-complainant: majority-vote}))))
+
+(define-private (update-arbitrator-success (arbitrator principal) (acc (response {dispute-id: uint, majority-for-complainant: bool} uint)))
+  (match acc
+    success-data
+      (let ((arbitrator-data (unwrap! (map-get? arbitrators arbitrator) (err u425)))
+            (vote-key {dispute: (get dispute-id success-data), arbitrator: arbitrator})
+            (arbitrator-vote (map-get? arbitrator-votes vote-key)))
+        (match arbitrator-vote
+          vote
+            (let ((voted-with-majority 
+                   (or (and (get majority-for-complainant success-data) (is-eq vote "complainant"))
+                       (and (not (get majority-for-complainant success-data)) (is-eq vote "respondent")))))
+              (map-set arbitrators arbitrator (merge arbitrator-data {
+                successful-cases: (if voted-with-majority 
+                                   (+ (get successful-cases arbitrator-data) u1)
+                                   (get successful-cases arbitrator-data))
+              }))
+              (ok success-data))
+          (ok success-data)))
+    error-val (err error-val)))
+
+(define-private (get-dispute-arbitrators (dispute-id uint))
+  (filter is-assigned-arbitrator (default-to (list) (map-get? active-arbitrator-list CONTRACT_OWNER))))
+
+(define-private (is-assigned-arbitrator (arbitrator principal))
+  (is-some (map-get? dispute-arbitrators {dispute: u1, arbitrator: arbitrator})))
+
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes dispute-id))
+
+(define-read-only (get-arbitrator (arbitrator principal))
+  (map-get? arbitrators arbitrator))
+
+(define-read-only (get-dispute-evidence (dispute-id uint))
+  (map-get? dispute-evidence dispute-id))
+
+(define-read-only (get-user-disputes (user principal))
+  (map-get? user-disputes user))
+
+(define-read-only (get-service-disputes (service-id uint))
+  (map-get? service-disputes service-id))
+
+(define-read-only (get-arbitrator-vote (dispute-id uint) (arbitrator principal))
+  (map-get? arbitrator-votes {dispute: dispute-id, arbitrator: arbitrator}))
+
+(define-read-only (is-dispute-arbitrator (dispute-id uint) (arbitrator principal))
+  (is-some (map-get? dispute-arbitrators {dispute: dispute-id, arbitrator: arbitrator})))
+
+(define-read-only (get-active-arbitrators)
+  (map-get? active-arbitrator-list CONTRACT_OWNER))
+
+(define-read-only (get-arbitrator-stake-amount)
+  (var-get arbitrator-stake))
+
+
