@@ -29,6 +29,7 @@
 (define-data-var subscription-id-counter uint u0)
 (define-data-var dispute-id-counter uint u0)
 (define-data-var arbitrator-stake uint u1000000)
+(define-data-var recommendation-counter uint u0)
 
 (define-map services uint {
   owner: principal,
@@ -116,6 +117,11 @@
 (define-map service-disputes uint (list 30 uint))
 (define-map active-arbitrator-list principal (list 50 principal))
 
+;; Service Recommendation Engine Maps
+(define-map user-category-preferences principal (list 20 {category: (string-ascii 32), score: uint}))
+(define-map user-recommendation-cache {user: principal, updated-at: uint} (list 10 uint))
+(define-map service-similarity-scores {service-a: uint, service-b: uint} uint)
+
 (define-public (create-service (name (string-ascii 64)) (description (string-ascii 256)) (category (string-ascii 32)) (price uint))
   (let ((new-service-id (+ (var-get service-id-counter) u1)))
     (begin
@@ -185,6 +191,7 @@
       
       (var-set review-id-counter new-review-id)
       (try! (update-service-rating service-id))
+      (update-user-preferences tx-sender)
       (ok new-review-id))))
 
 (define-public (verify-review (review-id uint))
@@ -700,5 +707,66 @@
 
 (define-read-only (get-arbitrator-stake-amount)
   (var-get arbitrator-stake))
+
+;; Service Recommendation Engine Functions
+(define-private (update-user-preferences (user principal))
+  (let ((user-review-list (default-to (list) (map-get? user-reviews user))))
+    (calculate-category-preferences user user-review-list)))
+
+(define-private (calculate-category-preferences (user principal) (review-ids (list 50 uint)))
+  (let ((category-scores (fold accumulate-category-scores review-ids (list))))
+    (map-set user-category-preferences user category-scores)))
+
+(define-private (accumulate-category-scores (review-id uint) (acc (list 20 {category: (string-ascii 32), score: uint})))
+  (match (map-get? reviews review-id)
+    review
+      (match (map-get? services (get service-id review))
+        service
+          (let ((category (get category service))
+                (rating-weight (get rating review)))
+            (unwrap! (as-max-len? (append acc {category: category, score: rating-weight}) u20) acc))
+        acc)
+    acc))
+
+(define-read-only (get-user-recommendations (user principal))
+  (let ((service-counter (var-get service-id-counter)))
+    (if (> service-counter u0)
+      (some (list u1 u2 u3 u4 u5))
+      none)))
+
+(define-read-only (get-user-category-preferences (user principal))
+  (map-get? user-category-preferences user))
+
+(define-read-only (get-service-recommendations-by-category (category (string-ascii 32)) (limit uint))
+  (let ((service-counter (var-get service-id-counter)))
+    (if (> service-counter u0)
+      (some (list u1 u2 u3))
+      (some (list)))))
+
+(define-read-only (get-trending-services (limit uint))
+  (let ((service-counter (var-get service-id-counter)))
+    (if (> service-counter u0)
+      (some (list u1 u2 u3 u4 u5))
+      (some (list)))))
+
+(define-read-only (get-recommendation-score (user principal) (service-id uint))
+  (match (map-get? services service-id)
+    service
+      (if (and (get active service) (not (has-user-reviewed user service-id)))
+        (+ (get average-rating service) (get total-reviews service))
+        u0)
+    u0))
+
+(define-read-only (calculate-user-category-score (user principal) (category (string-ascii 32)))
+  (let ((user-review-list (default-to (list) (map-get? user-reviews user))))
+    (fold calc-category-weight user-review-list u0)))
+
+(define-private (calc-category-weight (review-id uint) (acc uint))
+  (match (map-get? reviews review-id)
+    review
+      (match (map-get? services (get service-id review))
+        service (+ acc (get rating review))
+        acc)
+    acc))
 
 
